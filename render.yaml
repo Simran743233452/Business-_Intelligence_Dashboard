@@ -1,0 +1,39 @@
+# Render Blueprint for the AI Business Dashboard MCP server.
+#
+# This file only declares non-secret configuration - no credentials live
+# here. It documents the deployment (and can optionally be used with
+# Render's "New +" -> "Blueprint" flow), but nothing is deployed by the
+# mere presence of this file.
+#
+# Before the service will actually work, two things need to be added in
+# the Render dashboard (neither can be set from this file):
+#   - the Google service-account key as a Secret File named
+#     credentials.json (see README.md, "Providing Google credentials on
+#     Render")
+#   - a value for MCP_AUTH_TOKEN (see README.md, "Authentication") -
+#     declared below with sync: false so Render prompts for it at deploy
+#     time instead of it ever being written into this file
+services:
+  - type: web
+    name: ai-business-dashboard-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mcp_server.py
+    healthCheckPath: /health
+    envVars:
+      # Selects the remote HTTP transport instead of local stdio.
+      - key: MCP_TRANSPORT
+        value: streamable-http
+      # Bearer token required on every /mcp request (GET /health stays
+      # open). sync: false means Render never stores a value for this in
+      # the Blueprint - it prompts you to paste one in when the service is
+      # created, keeping the actual secret out of git entirely.
+      - key: MCP_AUTH_TOKEN
+        sync: false
+      # Path where the Secret File named "credentials.json" is mounted by
+      # Render (Render mounts secret files under /etc/secrets/<filename>).
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/credentials.json
+      # PORT is injected automatically by Render for web services - do not
+      # set it here. MCP_HOST already defaults to 0.0.0.0 in code.
