@@ -217,6 +217,39 @@ def _split_sites(head: str) -> list:
     return [head]
 
 
+# A leading "<code> <Capitalized Words>" site name with NO separator
+# after it at all (e.g. "079 Oaza Global Krishnagiri showing simultaneous
+# ..."). Consumes capitalized words after the code as part of the site
+# name, stopping at the first word that isn't capitalized - the natural
+# boundary between a proper-noun site name and a description that starts
+# with an ordinary word/verb. Used by Service Pattern Watch, the one
+# section whose bullets sometimes have no dash separating site from text
+# at all.
+_LEADING_SITE_RE = re.compile(r"^(\d{2,5}(?:\s+[A-Z][\w./-]*)*)\s+(.*)$")
+
+
+def _split_leading_site(content: str) -> tuple:
+    """Returns (site, rest) if `content` starts with a bare site-code
+    name (no dash after it); (None, content) otherwise."""
+    match = _LEADING_SITE_RE.match(content)
+    if not match:
+        return None, content
+    return match.group(1).strip(), match.group(2).strip()
+
+
+# A parenthetical, comma-separated list of bare site codes mentioned
+# inline mid-sentence, e.g. "Three separate sites (027, 055, 072) logged
+# inverter tripping today...".
+_INLINE_SITE_LIST_RE = re.compile(r"\(\s*(\d{2,5}(?:\s*,\s*\d{2,5})+)\s*\)")
+
+
+def _find_inline_site_codes(text: str) -> list:
+    match = _INLINE_SITE_LIST_RE.search(text)
+    if not match:
+        return []
+    return [code.strip() for code in match.group(1).split(",")]
+
+
 _TRAILING_PAREN_LIST_RE = re.compile(r"\(([^()]*)\)[.\s]*$")
 _TRAILING_WORD_RE = re.compile(r"\s*\b(?:respectively|resp\.?)\b\.?\s*$", re.IGNORECASE)
 
@@ -479,7 +512,7 @@ def _parse_actions_taken(block: str) -> list:
 def _parse_whats_needed_next(block: str) -> list:
     """Parse "- [Site] — [required next action]" bullets, OR numbered
     items ("1.", "2.", ...) which may just be free text with no site at
-    all - each becomes its own row (Section = "What's Needed Next").
+    all - each becomes its own Monitoring row (see build_monitoring_rows).
 
     If an item has no site separator (just free text, however long),
     site is left blank rather than guessed - this also keeps older-style
@@ -500,26 +533,55 @@ def _parse_whats_needed_next(block: str) -> list:
 
 
 def _parse_service_pattern_watch(block: str) -> list:
-    """Parse Service Pattern Watch items.
+    """Parse Service Pattern Watch items. Tried in order:
 
-    The template only guarantees free-text ("[Recurring issue/site/vendor
-    pattern]"), so the full text always becomes the Pattern value - this
-    already means a Site/Vendor aren't required (they're simply left
-    blank when the item has no further dash-separated fields). If the
-    admin optionally writes it as "Pattern — Site — Vendor — Notes" the
-    extra fields are captured too.
+    1. "<site code(s)> — pattern description" (dash-separated, head looks
+       like one or more site codes) - one row per site, sharing the text.
+    2. "<code> <Capitalized Site Name> <description...>" with NO
+       separator at all (e.g. "079 Oaza Global Krishnagiri showing
+       simultaneous full inverter outage...") - site name is taken as the
+       leading run of capitalized words after the code.
+    3. Site(s) mentioned inline mid-sentence in parentheses (e.g. "Three
+       separate sites (027, 055, 072) logged inverter tripping today...")
+       - one row per site, sharing the full text.
+    4. Fallback: the original template's free-text shape, optionally
+       "Pattern — Site — Vendor — Notes" if the admin wrote it with
+       dashes; with no dashes at all, the whole text becomes Pattern.
+       Site/Vendor/Notes are never required - nothing is dropped either
+       way, just not associated with a specific site when one can't be
+       confidently identified.
     """
     items = []
     for line in _block_lines(block):
         content = _strip_bullet(line)
         if not content:
             continue
+
+        head, has_sep, rest = _partition_first_dash(content)
+        if has_sep:
+            sites = _split_sites(head)
+            if sites and all(SITE_CODE_RE.match(s) for s in sites):
+                for site in sites:
+                    items.append({"pattern": rest, "site": site, "vendor": "", "notes": ""})
+                continue
+
+        site, rest_after_site = _split_leading_site(content)
+        if site:
+            items.append({"pattern": rest_after_site, "site": site, "vendor": "", "notes": ""})
+            continue
+
+        inline_sites = _find_inline_site_codes(content)
+        if inline_sites:
+            for inline_site in inline_sites:
+                items.append({"pattern": content, "site": inline_site, "vendor": "", "notes": ""})
+            continue
+
         parts = _split_dash(content)
         pattern = parts[0] if parts else content
-        site = parts[1] if len(parts) > 1 else ""
+        parsed_site = parts[1] if len(parts) > 1 else ""
         vendor = parts[2] if len(parts) > 2 else ""
         notes = parts[3] if len(parts) > 3 else ""
-        items.append({"pattern": pattern, "site": site, "vendor": vendor, "notes": notes})
+        items.append({"pattern": pattern, "site": parsed_site, "vendor": vendor, "notes": notes})
     return items
 
 
@@ -599,98 +661,193 @@ def parse_monitoring_summary(summary: str) -> dict:
 # -----------------------------------------------------------------------
 # Unified Monitoring sheet schema
 # -----------------------------------------------------------------------
-# All five sections write into ONE "Monitoring" tab (rather than one tab
-# per section), distinguished by the Section column. This is a separate
-# transformation step on top of parse_monitoring_summary()'s output above
-# - the section-detection/tolerance logic itself is untouched by it, this
-# just reshapes the already-parsed data into flat rows.
+# All five sections write into ONE "Monitoring" tab as plain operational
+# rows - no "Section" column. This is a business-facing schema (built for
+# a founder/manager scanning the sheet directly), not an internal
+# bookkeeping one, so which SUMMARY SECTION a row came from is not itself
+# a column; instead each row stands on its own as an issue/action/KPI
+# entry. The Daily Summary section becomes one row per date with
+# Site = "ALL SITES" (see build_monitoring_rows), which is what a
+# dashboard formula would filter on to find the daily KPI row.
+#
+# This is a separate transformation step on top of
+# parse_monitoring_summary()'s output above - the section-detection and
+# per-item text extraction (site/multi-site splitting, days-open,
+# per-site value mapping, etc.) is untouched by it, this just reshapes
+# already-parsed data into flat rows plus a few best-effort
+# classifications (Category/Priority/Status - see _classify_* below).
 MONITORING_HEADERS = [
     "Date",
-    "Section",
     "Site",
-    "Description",
+    "Issue",
+    "Category",
+    "Priority",
+    "Status",
     "Days Open",
     "Action Taken",
-    "What's Needed Next",
+    "Next Action",
+    "Vendor",
     "New Issues",
     "Issues Resolved",
     "Total Open Issues",
-    "Vendor",
-    "Pattern/Notes",
+    "Notes",
 ]
 
 # Column name -> position, so row-building reads as named slots instead
 # of magic indexes.
 _COL = {name: index for index, name in enumerate(MONITORING_HEADERS)}
 
+# Category keywords, checked in this order (first match wins) - "Outage"
+# is checked before "Inverter"/"Optimizer" since an outage bullet often
+# also mentions inverters/optimizers, but the outage itself is the more
+# useful classification (matches how a founder would triage it).
+_CATEGORY_RULES = [
+    ("Outage", ("outage",)),
+    ("Inverter", ("inverter",)),
+    ("Optimizer", ("optimizer",)),
+    ("Vendor", ("vendor",)),
+    ("Service", ("case filed", "site visit", "on-site", "on site", "technician", "replacement", "service")),
+    ("Monitoring", ("tracker", "report", "monitoring")),
+]
 
-def _empty_row(date_value: str, section: str) -> list:
+# Priority is only ever assigned on an explicit, conservative signal -
+# per the "do not invent priority unnecessarily" rule, most rows are
+# expected to end up with no priority at all.
+_CRITICAL_RE = re.compile(
+    r"\bcritical\b|\bfull\b[^.]*\boutage\b|\bcomplete\b[^.]*\boutage\b|\ball\s+\d+[^.]*\bdown\b",
+    re.IGNORECASE,
+)
+_HIGH_RE = re.compile(r"\burgent\b|\bpriority escalation\b", re.IGNORECASE)
+
+# Status: "Unconfirmed" must win over everything else (checked first) -
+# an item that says "cannot confirm X is resolved" must never come out as
+# Resolved. Only an explicit resolution word yields "Resolved"; anything
+# else falls back to whatever the caller passes as the section's default
+# (see build_monitoring_rows), never invented from silence.
+_UNCONFIRMED_RE = re.compile(
+    r"\bunconfirmed\b|\bcannot confirm\b|\bcan.t confirm\b|\bcan not confirm\b|\bnot confirmed\b",
+    re.IGNORECASE,
+)
+_RESOLVED_RE = re.compile(r"\bresolved\b|\bfixed\b|\bcompleted\b", re.IGNORECASE)
+
+
+def _classify_category(text: str) -> str:
+    lower = text.lower()
+    for category, keywords in _CATEGORY_RULES:
+        if any(keyword in lower for keyword in keywords):
+            return category
+    return ""
+
+
+def _classify_priority(text: str) -> str:
+    if _CRITICAL_RE.search(text):
+        return "Critical"
+    if _HIGH_RE.search(text):
+        return "High"
+    if "medium priority" in text.lower():
+        return "Medium"
+    if "low priority" in text.lower():
+        return "Low"
+    return ""
+
+
+def _classify_status(text: str, default: str = "") -> str:
+    if _UNCONFIRMED_RE.search(text):
+        return "Unconfirmed"
+    if _RESOLVED_RE.search(text):
+        return "Resolved"
+    return default
+
+
+def _empty_row(date_value: str, site: str = "") -> list:
     row = [""] * len(MONITORING_HEADERS)
     row[_COL["Date"]] = date_value
-    row[_COL["Section"]] = section
+    row[_COL["Site"]] = site
     return row
 
 
 def build_monitoring_rows(parsed: dict) -> dict:
     """Convert parse_monitoring_summary()'s structured dict into row lists
-    for the unified Monitoring sheet (column order: MONITORING_HEADERS).
+    for the unified Monitoring sheet (column order: MONITORING_HEADERS,
+    no Section column).
 
-    Returns one list per section:
+    Returns one list per section of the SOURCE summary (this grouping is
+    purely so a caller can write/dedupe each independently - it has no
+    bearing on the sheet, which has no Section column):
         {
-            "daily_summary": [row],                 # always exactly 1
+            "daily_summary": [row],                 # always exactly 1,
+                                                      # Site = "ALL SITES"
             "needs_attention": [row, ...],
             "actions_taken": [row, ...],
             "whats_needed_next": [row, ...],
             "service_pattern_watch": [row, ...],
         }
-    kept separate (rather than one flat list) so a caller can write/dedupe
-    each section independently while they all share one tab and one
-    column layout.
 
-    Fields a section's bullet doesn't cleanly supply are left blank
-    rather than guessed; any leftover context that doesn't map to a
-    dedicated column lands in Description or Pattern/Notes instead of
-    being discarded (see parse_monitoring_summary's "issues_today_notes"
-    and each section's own free-text handling).
+    Category/Priority/Status are best-effort classifications from
+    keyword rules (see _classify_* above) - never invented when the text
+    doesn't clearly indicate one, left blank instead. Fields a section's
+    bullet doesn't cleanly supply are also left blank rather than
+    guessed; any leftover context that doesn't map to a dedicated column
+    lands in Notes instead of being discarded.
     """
     date_value = parsed["date"]
 
-    daily_row = _empty_row(date_value, "Daily Summary")
+    daily_row = _empty_row(date_value, "ALL SITES")
+    daily_row[_COL["Issue"]] = "Daily operational summary"
     daily_row[_COL["New Issues"]] = parsed["new_issues"]
     daily_row[_COL["Issues Resolved"]] = parsed["resolved_issues"]
     daily_row[_COL["Total Open Issues"]] = parsed["total_open_issues"]
-    daily_row[_COL["Pattern/Notes"]] = parsed.get("issues_today_notes", "")
+    daily_row[_COL["Notes"]] = parsed.get("issues_today_notes", "")
 
     needs_attention_rows = []
     for item in parsed["needs_attention"]:
-        row = _empty_row(date_value, "Needs Attention")
-        row[_COL["Site"]] = item["site"]
-        row[_COL["Description"]] = item["description"]
+        description = item["description"]
+        row = _empty_row(date_value, item["site"])
+        row[_COL["Issue"]] = description
+        row[_COL["Category"]] = _classify_category(description)
+        row[_COL["Priority"]] = _classify_priority(description)
+        row[_COL["Status"]] = _classify_status(description, default="Open")
         row[_COL["Days Open"]] = item["days_open"]
         needs_attention_rows.append(row)
 
     actions_taken_rows = []
     for item in parsed["actions_taken"]:
-        row = _empty_row(date_value, "Actions Taken")
-        row[_COL["Site"]] = item["site"]
-        row[_COL["Description"]] = item["description"]
+        combined = f"{item['description']} {item['action']}".strip()
+        row = _empty_row(date_value, item["site"])
+        # Issue falls back to the action text itself when there's no
+        # separately-extracted issue, so the column is never blank
+        # while Action Taken has real content.
+        row[_COL["Issue"]] = item["description"] or item["action"]
+        row[_COL["Category"]] = _classify_category(combined)
+        row[_COL["Priority"]] = _classify_priority(combined)
+        row[_COL["Status"]] = _classify_status(combined, default="Open")
         row[_COL["Action Taken"]] = item["action"]
         actions_taken_rows.append(row)
 
     whats_needed_next_rows = []
     for item in parsed["whats_needed_next"]:
-        row = _empty_row(date_value, "What's Needed Next")
-        row[_COL["Site"]] = item["site"]
-        row[_COL["What's Needed Next"]] = item["requirement"]
+        requirement = item["requirement"]
+        row = _empty_row(date_value, item["site"])
+        row[_COL["Issue"]] = requirement
+        row[_COL["Category"]] = _classify_category(requirement)
+        row[_COL["Priority"]] = _classify_priority(requirement)
+        row[_COL["Status"]] = _classify_status(requirement, default="Open")
+        row[_COL["Next Action"]] = requirement
         whats_needed_next_rows.append(row)
 
     service_pattern_watch_rows = []
     for item in parsed["service_pattern_watch"]:
-        row = _empty_row(date_value, "Service Pattern Watch")
-        row[_COL["Site"]] = item["site"]
-        row[_COL["Description"]] = item["pattern"]
+        combined = f"{item['pattern']} {item['notes']}".strip()
+        row = _empty_row(date_value, item["site"])
+        row[_COL["Issue"]] = item["pattern"]
+        row[_COL["Category"]] = _classify_category(combined)
+        row[_COL["Priority"]] = _classify_priority(combined)
+        # Service Pattern Watch defaults to "Monitoring" (an observed,
+        # ongoing pattern) rather than "Open" - it isn't a discrete issue
+        # awaiting resolution the way Needs Attention items are.
+        row[_COL["Status"]] = _classify_status(combined, default="Monitoring")
         row[_COL["Vendor"]] = item["vendor"]
-        row[_COL["Pattern/Notes"]] = item["notes"]
+        row[_COL["Notes"]] = item["notes"]
         service_pattern_watch_rows.append(row)
 
     return {

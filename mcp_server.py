@@ -7,6 +7,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from summary_parser import parse_monitoring_summary, build_monitoring_rows, MONITORING_HEADERS
+from accounting_parser import parse_accounting_summary, build_accounting_rows, ACCOUNTING_HEADERS
 from sheets_service import append_unique_rows, upsert_row_by_key
 from auth_middleware import BearerTokenMiddleware
 
@@ -29,21 +30,44 @@ SCOPES = [
 # Tab used by process_monitoring_summary
 # -----------------------------
 # All monitoring sections (Daily Summary, Needs Attention, Actions Taken,
-# What's Needed Next, Service Pattern Watch) now write into this ONE tab,
-# distinguished by its Section column - see summary_parser.MONITORING_HEADERS
-# for the exact column order and build_monitoring_rows() for how a parsed
-# summary becomes rows. Previously each section had its own tab; those tabs
-# (Daily Summary, Needs Attention, etc.) still exist in the spreadsheet but
-# are no longer written to.
+# What's Needed Next, Service Pattern Watch) write into this ONE tab as
+# plain business-facing rows - no Section column (see
+# summary_parser.MONITORING_HEADERS for the exact column order and
+# build_monitoring_rows() for how a parsed summary becomes rows).
+# Previously each section had its own tab; those tabs (Daily Summary,
+# Needs Attention, etc.) still exist in the spreadsheet but are no longer
+# written to.
 MONITORING_TAB = "Monitoring"
 
-# Composite key for the Daily Summary row's upsert: (Date, Section) rather
-# than Date alone, since this tab now also holds other sections' rows for
-# the same date - without Section in the key, upserting today's Daily
-# Summary row could otherwise match and overwrite a Needs Attention row
-# that happens to share the same date.
+# Composite key for the Daily Summary row's upsert: (Date, Site) rather
+# than Date alone, since this tab also holds other rows for the same
+# date. The Daily Summary row is always written with Site = "ALL SITES"
+# (see build_monitoring_rows), which no real site name would collide
+# with, so this reliably matches only that row - without Site in the
+# key, upserting today's Daily Summary row could otherwise match and
+# overwrite an unrelated row that happens to share the same date.
 _DATE_COL = MONITORING_HEADERS.index("Date")
-_SECTION_COL = MONITORING_HEADERS.index("Section")
+_SITE_COL = MONITORING_HEADERS.index("Site")
+
+# -----------------------------
+# Tab used by process_accounting_summary
+# -----------------------------
+# Renamed from "Finance" (which held only an unused placeholder header,
+# no real data - see accounting_parser.py for the migration performed).
+# All accounting record types (Exception, Cash, Sale, Purchase, Expense,
+# Tax, Pending) write into this ONE tab as plain rows distinguished by
+# their Record Type column - see accounting_parser.ACCOUNTING_HEADERS for
+# the exact column order and build_accounting_rows() for how a parsed
+# summary becomes rows.
+ACCOUNTING_TAB = "Accounting"
+
+# Composite key for the Cash and Purchase rows' upsert: (Date, Record
+# Type). Each report has at most one Cash row and one Purchase row, so
+# reprocessing the same date's summary should update those rows in place
+# rather than accumulate duplicates - the same "one row per date"
+# pattern as Monitoring's Daily Summary row.
+_ACCT_DATE_COL = ACCOUNTING_HEADERS.index("Date")
+_ACCT_RECORD_TYPE_COL = ACCOUNTING_HEADERS.index("Record Type")
 
 
 # -----------------------------
@@ -101,9 +125,10 @@ def process_monitoring_summary(summary: str) -> str:
     """Parse a complete SUNTROP SOLAR Plant Monitoring Summary and write
     every section - daily totals, needs attention, actions taken, what's
     needed next, and service pattern watch - into the unified Monitoring
-    sheet (one tab, one 12-column schema, distinguished by its Section
-    column). This is the main tool for the Admin -> Claude -> Sheets
-    workflow: paste the whole raw summary text as `summary`.
+    sheet as plain business-facing rows (one tab, one 14-column schema,
+    no Section column - the daily totals become a single row with
+    Site = "ALL SITES"). This is the main tool for the Admin -> Claude ->
+    Sheets workflow: paste the whole raw summary text as `summary`.
 
     Parsing is deterministic (no LLM call here) and tied to the fixed
     template. Re-running the same summary will not create duplicate rows.
@@ -116,10 +141,10 @@ def process_monitoring_summary(summary: str) -> str:
     rows = build_monitoring_rows(parsed)
     report_date = parsed["date"]
 
-    # --- Daily Summary: exactly one row per (Date, Section); re-runs update it in place ---
+    # --- Daily Summary: exactly one row per (Date, "ALL SITES"); re-runs update it in place ---
     upsert_row_by_key(
         service, SPREADSHEET_ID, MONITORING_TAB, MONITORING_HEADERS,
-        rows["daily_summary"][0], key_indexes=[_DATE_COL, _SECTION_COL],
+        rows["daily_summary"][0], key_indexes=[_DATE_COL, _SITE_COL],
     )
 
     # --- Needs Attention: one row per overdue/escalated item, if any ---
@@ -156,6 +181,78 @@ def process_monitoring_summary(summary: str) -> str:
         f"Actions Taken: {actions_taken_count} row(s)\n"
         f"What's Needed Next: {needed_next_count} row(s)\n"
         f"Service Pattern Watch: {pattern_count} row(s)"
+    )
+
+
+# ---------------------------
+# Tool 3: Process a full Day Book (Accounting) Summary
+# ---------------------------
+
+@mcp.tool()
+def process_accounting_summary(summary: str) -> str:
+    """Parse a complete SUNTROP SOLAR Day Book Summary and write every
+    section - exceptions requiring attention, cash & bank position,
+    sales, purchase, expenses/journal entries, GST/tax watch items, and
+    pending-from-yesterday items - into the unified Accounting sheet as
+    plain rows (one tab, one 20-column schema, distinguished by a Record
+    Type column: Exception, Cash, Sale, Purchase, Expense, Tax, Pending).
+    Paste the whole raw Day Book summary text as `summary`.
+
+    Parsing is deterministic (no LLM call here) and tied to the fixed
+    template. Re-running the same summary will not create duplicate rows.
+    """
+
+    parsed = parse_accounting_summary(summary)
+    rows = build_accounting_rows(parsed)
+    report_date = parsed["date"]
+
+    # --- Cash & Purchase: exactly one row per (Date, Record Type); re-runs update in place ---
+    if rows["cash"]:
+        upsert_row_by_key(
+            service, SPREADSHEET_ID, ACCOUNTING_TAB, ACCOUNTING_HEADERS,
+            rows["cash"][0], key_indexes=[_ACCT_DATE_COL, _ACCT_RECORD_TYPE_COL],
+        )
+    if rows["purchase"]:
+        upsert_row_by_key(
+            service, SPREADSHEET_ID, ACCOUNTING_TAB, ACCOUNTING_HEADERS,
+            rows["purchase"][0], key_indexes=[_ACCT_DATE_COL, _ACCT_RECORD_TYPE_COL],
+        )
+
+    # --- Exceptions, Sales, Expenses, Tax watch, Pending: append-if-not-duplicate ---
+    issues_count = append_unique_rows(
+        service, SPREADSHEET_ID, ACCOUNTING_TAB, ACCOUNTING_HEADERS,
+        rows["issues"], key_indexes=list(range(len(ACCOUNTING_HEADERS))),
+    )
+    sales_count = append_unique_rows(
+        service, SPREADSHEET_ID, ACCOUNTING_TAB, ACCOUNTING_HEADERS,
+        rows["sales"], key_indexes=list(range(len(ACCOUNTING_HEADERS))),
+    )
+    expenses_count = append_unique_rows(
+        service, SPREADSHEET_ID, ACCOUNTING_TAB, ACCOUNTING_HEADERS,
+        rows["expenses"], key_indexes=list(range(len(ACCOUNTING_HEADERS))),
+    )
+    tax_count = append_unique_rows(
+        service, SPREADSHEET_ID, ACCOUNTING_TAB, ACCOUNTING_HEADERS,
+        rows["tax"], key_indexes=list(range(len(ACCOUNTING_HEADERS))),
+    )
+    pending_count = append_unique_rows(
+        service, SPREADSHEET_ID, ACCOUNTING_TAB, ACCOUNTING_HEADERS,
+        rows["pending"], key_indexes=list(range(len(ACCOUNTING_HEADERS))),
+    )
+
+    return (
+        "Accounting summary processed successfully.\n"
+        f"Date: {report_date}\n"
+        "Sections processed: Issues Requiring Attention, Cash & Bank Position, "
+        "Sales, Purchase, Expenses & Journal Entries, GST/Tax Watch Items, "
+        "Pending From Yesterday\n"
+        f"Cash & Bank Position: {'updated' if rows['cash'] else '0 row(s)'}\n"
+        f"Purchase: {'updated' if rows['purchase'] else '0 row(s)'}\n"
+        f"Issues Requiring Attention: {issues_count} row(s)\n"
+        f"Sales: {sales_count} row(s)\n"
+        f"Expenses & Journal Entries: {expenses_count} row(s)\n"
+        f"GST/Tax Watch Items: {tax_count} row(s)\n"
+        f"Pending From Yesterday: {pending_count} row(s)"
     )
 
 

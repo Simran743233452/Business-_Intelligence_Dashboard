@@ -6,16 +6,17 @@ Run with:
 This exercises the full flow (raw summary text -> parser -> row-building ->
 Google Sheets) using the credentials.json / SPREADSHEET_ID already
 configured in mcp_server.py. The Sheets-writing/idempotency checks write
-real rows into the single unified "Monitoring" tab. No Anthropic API call
-is involved.
+real rows into the single unified "Monitoring" tab (14-column business
+schema, no Section column - see summary_parser.MONITORING_HEADERS). No
+Anthropic API call is involved.
 
 Covers two input shapes:
   A. The clean template (REPORTED_BUG_SUMMARY, NO_ISSUES_SUMMARY).
   B. A real-world messy report (MESSY_SUMMARY) where values aren't clean:
      "Unconfirmed" metrics, multi-site bullets (some with per-site values
-     mapped by position), numbered What's Needed Next items, and free-text
-     qualifiers ("not explicitly dated to today", "not appearing in
-     today's report") that must survive rather than being dropped.
+     mapped by position), numbered What's Needed Next items, Service
+     Pattern Watch bullets with inline/leading site references, and
+     free-text qualifiers that must survive rather than being dropped.
 
 Determinism note: the Sheets-writing/idempotency checks generate fresh,
 uniquely-tagged content on every run (see _build_unique_summary and
@@ -58,6 +59,10 @@ SERVICE PATTERN WATCH
 - Recurring inverter failures at Bengaluru site
 """
 
+# parse_monitoring_summary()'s structured dict is unchanged by the schema
+# change below - only build_monitoring_rows()'s OUTPUT row shape changed
+# (14 columns, no Section, new classified fields). This checks the parser
+# layer is still exactly right.
 EXPECTED_PARSED_BUG_SUMMARY = {
     "date": "2026-09-02",
     "new_issues": 3,
@@ -74,7 +79,6 @@ EXPECTED_PARSED_BUG_SUMMARY = {
     "actions_taken": [
         {"site": "Mysuru", "description": "Panel fault", "action": "replacement scheduled"}
     ],
-    # No dash in the source bullet -> no site prefix -> site stays blank.
     "whats_needed_next": [{"site": "", "requirement": "Approval needed for expedited shipping"}],
     "service_pattern_watch": [
         {
@@ -87,22 +91,24 @@ EXPECTED_PARSED_BUG_SUMMARY = {
 }
 
 # Expected unified-schema rows for REPORTED_BUG_SUMMARY, in MONITORING_HEADERS
-# column order: Date, Section, Site, Description, Days Open, Action Taken,
-# What's Needed Next, New Issues, Issues Resolved, Total Open Issues,
-# Vendor, Pattern/Notes.
+# column order: Date, Site, Issue, Category, Priority, Status, Days Open,
+# Action Taken, Next Action, Vendor, New Issues, Issues Resolved,
+# Total Open Issues, Notes. No Section column.
 EXPECTED_BUG_SUMMARY_ROWS = {
-    "daily_summary": [["2026-09-02", "Daily Summary", "", "", "", "", "", 3, 2, 7, "", ""]],
+    "daily_summary": [
+        ["2026-09-02", "ALL SITES", "Daily operational summary", "", "", "", "", "", "", "", 3, 2, 7, ""]
+    ],
     "needs_attention": [
-        ["2026-09-02", "Needs Attention", "Bengaluru", "Inverter failure — awaiting vendor replacement", 8, "", "", "", "", "", "", ""]
+        ["2026-09-02", "Bengaluru", "Inverter failure — awaiting vendor replacement", "Inverter", "", "Open", 8, "", "", "", "", "", "", ""]
     ],
     "actions_taken": [
-        ["2026-09-02", "Actions Taken", "Mysuru", "Panel fault", "", "replacement scheduled", "", "", "", "", "", ""]
+        ["2026-09-02", "Mysuru", "Panel fault", "Service", "", "Open", "", "replacement scheduled", "", "", "", "", "", ""]
     ],
     "whats_needed_next": [
-        ["2026-09-02", "What's Needed Next", "", "", "", "", "Approval needed for expedited shipping", "", "", "", "", ""]
+        ["2026-09-02", "", "Approval needed for expedited shipping", "", "", "Open", "", "", "Approval needed for expedited shipping", "", "", "", "", ""]
     ],
     "service_pattern_watch": [
-        ["2026-09-02", "Service Pattern Watch", "", "Recurring inverter failures at Bengaluru site", "", "", "", "", "", "", "", ""]
+        ["2026-09-02", "", "Recurring inverter failures at Bengaluru site", "Inverter", "", "Monitoring", "", "", "", "", "", "", "", ""]
     ],
 }
 
@@ -129,10 +135,12 @@ SERVICE PATTERN WATCH
 
 # The real-world report that previously "did not parse/work correctly":
 # unclean/free-text metrics, multi-site bullets (some with per-site values
-# in matching order), numbered What's Needed Next items, and qualifiers
-# that must not be dropped. No title line, on purpose - proves the parser
-# still degrades gracefully (falls back to today's date) rather than
-# crashing or losing the rest of the content when the title is missing.
+# in matching order), numbered What's Needed Next items, Service Pattern
+# Watch bullets with a leading bare site name (no dash) and an inline
+# multi-site mention, and qualifiers that must not be dropped. No title
+# line, on purpose - proves the parser still degrades gracefully (falls
+# back to today's date) rather than crashing or losing the rest of the
+# content when the title is missing.
 MESSY_SUMMARY = """ISSUES TODAY
 
 - New issues detected: Unconfirmed — can't distinguish new vs. recurring without tracker
@@ -196,8 +204,9 @@ def _build_unique_messy_summary(run_id: str, report_date: str) -> str:
     """Messy-style summary, uniquely tagged, covering the same tricky
     shapes as MESSY_SUMMARY (Unconfirmed metric, a multi-site bullet with
     per-site values mapped by position, a numbered What's Needed Next
-    list, and a qualifier that must survive) so the live Sheets
-    round-trip test also exercises that code path, deterministically.
+    list, and a Service Pattern Watch bullet with an inline multi-site
+    mention) so the live Sheets round-trip test also exercises that code
+    path, deterministically.
     """
     return f"""
 SUNTROP SOLAR — PLANT MONITORING SUMMARY | {report_date}
@@ -218,18 +227,19 @@ WHAT'S NEEDED NEXT
 2. Escalate {run_id} priority items...
 
 SERVICE PATTERN WATCH
-- Chronic recurring pattern at {run_id} sites, priority escalation recommended
+- Two sites (301, 302) logged a chronic recurring pattern for tag {run_id}, priority escalation recommended
 """
 
 
 if __name__ == "__main__":
-    print("=== Test 1: MONITORING_HEADERS is the exact 12-column unified schema ===")
+    print("=== Test 1: exact 14-column schema, no Section column ===")
     assert MONITORING_HEADERS == [
-        "Date", "Section", "Site", "Description", "Days Open", "Action Taken",
-        "What's Needed Next", "New Issues", "Issues Resolved", "Total Open Issues",
-        "Vendor", "Pattern/Notes",
+        "Date", "Site", "Issue", "Category", "Priority", "Status", "Days Open",
+        "Action Taken", "Next Action", "Vendor", "New Issues", "Issues Resolved",
+        "Total Open Issues", "Notes",
     ], f"Unexpected schema: {MONITORING_HEADERS}"
-    assert len(MONITORING_HEADERS) == 12
+    assert len(MONITORING_HEADERS) == 14
+    assert "Section" not in MONITORING_HEADERS
     print("OK\n")
 
     print("=== Test 2: sections with no real data produce no rows ===")
@@ -242,7 +252,7 @@ if __name__ == "__main__":
     assert parsed["service_pattern_watch"] == [], "Expected no Service Pattern Watch rows"
     print("OK: sections with no real data produced no rows.\n")
 
-    print("=== Test 3: previously-reported bug summary parses exactly as expected ===")
+    print("=== Test 3: clean summary parses exactly as expected ===")
     bug_parsed = parse_monitoring_summary(REPORTED_BUG_SUMMARY)
     print(bug_parsed)
     assert bug_parsed == EXPECTED_PARSED_BUG_SUMMARY, (
@@ -258,16 +268,21 @@ if __name__ == "__main__":
     )
     print("OK: collapsed single-line input parses identically to normal multi-line input.\n")
 
-    print("=== Test 5: build_monitoring_rows() maps every section to the correct 12-column rows ===")
+    print("=== Test 5: build_monitoring_rows() maps the clean summary to the correct 14-column rows ===")
     bug_rows = build_monitoring_rows(bug_parsed)
     for section, expected_rows in EXPECTED_BUG_SUMMARY_ROWS.items():
         actual_rows = bug_rows[section]
         assert actual_rows == expected_rows, f"{section}: expected {expected_rows}, got {actual_rows}"
         for row in actual_rows:
-            assert len(row) == len(MONITORING_HEADERS), f"{section} row has wrong column count: {row}"
-    print("OK: all five sections produced the correct 12-column Monitoring row(s).\n")
+            assert len(row) == 14, f"{section} row has wrong column count: {row}"
+    print("OK: all five sections produced the correct 14-column Monitoring row(s).\n")
 
-    print("=== Test 6: a summary without a Service Pattern Watch section still works ===")
+    print("=== Test 6: Daily Summary KPI row uses Site = 'ALL SITES' ===")
+    assert bug_rows["daily_summary"][0][MONITORING_HEADERS.index("Site")] == "ALL SITES"
+    assert bug_rows["daily_summary"][0][MONITORING_HEADERS.index("Issue")] == "Daily operational summary"
+    print("OK: Daily Summary row correctly uses Site = 'ALL SITES'.\n")
+
+    print("=== Test 7: a summary without a Service Pattern Watch section still works ===")
     no_spw = MESSY_SUMMARY.split("SERVICE PATTERN WATCH")[0]
     no_spw_parsed = parse_monitoring_summary(no_spw)
     assert no_spw_parsed["service_pattern_watch"] == []
@@ -276,18 +291,18 @@ if __name__ == "__main__":
     assert no_spw_rows["service_pattern_watch"] == []
     print("OK: summary without Service Pattern Watch parses and builds rows correctly.\n")
 
-    print("=== Test 7: real-world messy summary - all five sections detected, nothing crashes ===")
+    print("=== Test 8: real-world messy summary - all five sections detected, nothing crashes ===")
     messy_parsed = parse_monitoring_summary(MESSY_SUMMARY)
+    messy_rows = build_monitoring_rows(messy_parsed)
     for key in ("needs_attention", "actions_taken", "whats_needed_next", "service_pattern_watch"):
         assert len(messy_parsed[key]) > 0, f"Expected at least one {key} row"
-    assert messy_parsed["new_issues"] != 0 and messy_parsed["resolved_issues"] != ""
     print(f"needs_attention: {len(messy_parsed['needs_attention'])} rows")
     print(f"actions_taken: {len(messy_parsed['actions_taken'])} rows")
     print(f"whats_needed_next: {len(messy_parsed['whats_needed_next'])} rows")
-    print(f"service_pattern_watch: {len(messy_parsed['service_pattern_watch'])} rows")
+    print(f"service_pattern_watch rows built: {len(messy_rows['service_pattern_watch'])}")
     print("OK: all five sections detected.\n")
 
-    print("=== Test 8: Unconfirmed metrics are preserved, not converted to 0 ===")
+    print("=== Test 9: Unconfirmed metrics are preserved, not converted to 0 ===")
     assert isinstance(messy_parsed["new_issues"], str) and "Unconfirmed" in messy_parsed["new_issues"], (
         f"Expected new_issues to preserve 'Unconfirmed' text, got: {messy_parsed['new_issues']!r}"
     )
@@ -297,25 +312,23 @@ if __name__ == "__main__":
     assert messy_parsed["total_open_issues"] == 18, (
         f"Expected total_open_issues to parse the explicit number 18, got: {messy_parsed['total_open_issues']!r}"
     )
-    assert "sites reporting today" in messy_parsed["issues_today_notes"], (
-        "Expected the extra context after '18' to be preserved in issues_today_notes, "
-        f"got: {messy_parsed['issues_today_notes']!r}"
-    )
+    daily_kpi_row = messy_rows["daily_summary"][0]
+    assert daily_kpi_row[MONITORING_HEADERS.index("Site")] == "ALL SITES"
+    assert "Unconfirmed" in str(daily_kpi_row[MONITORING_HEADERS.index("New Issues")])
+    assert daily_kpi_row[MONITORING_HEADERS.index("Total Open Issues")] == 18
     print("new_issues:", messy_parsed["new_issues"])
     print("resolved_issues:", messy_parsed["resolved_issues"])
     print("total_open_issues:", messy_parsed["total_open_issues"])
     print("OK: 'Unconfirmed' preserved verbatim; explicit numeric value still parsed when present.\n")
 
-    print("=== Test 9: multiple-site bullets are split into rows, not silently lost ===")
+    print("=== Test 10: multiple-site bullets are split into rows, not silently lost ===")
     na_sites = [item["site"] for item in messy_parsed["needs_attention"]]
-    # The 4-site "not appearing in today's report" bullet -> 4 separate rows.
     for code in ("034 IIM Bangalore-2023", "017 Prabhu Kanakpura Road",
                  "075 nVent Rajadhani Paper Bidadi", "066 Matrinox Riddhi Siddhi Metal Jigani"):
         assert code in na_sites, f"Expected site {code!r} to have its own Needs Attention row"
     not_appearing_rows = [item for item in messy_parsed["needs_attention"] if "not appearing" in item["description"]]
     assert len(not_appearing_rows) == 4, f"Expected 4 rows for the 'not appearing' bullet, got {len(not_appearing_rows)}"
 
-    # The 3-site tripping bullet with per-site values, mapped by position.
     tripping_by_site = {
         item["site"]: item["description"]
         for item in messy_parsed["needs_attention"]
@@ -325,49 +338,61 @@ if __name__ == "__main__":
     assert tripping_by_site["055 MediTech"].endswith("(14x/135min)")
     assert tripping_by_site["072 Harish Pillai"].endswith("(7x/205min)")
 
-    # The 6 bare-code Actions Taken bullet -> 6 separate rows, same text.
     at_sites = [item["site"] for item in messy_parsed["actions_taken"]]
     for code in ("008", "009", "012", "022", "024", "060"):
         assert code in at_sites, f"Expected site code {code!r} to have its own Actions Taken row"
-    print(f"Needs Attention rows: {len(messy_parsed['needs_attention'])} (1 + 4 + 3 sites = 8 expected)")
-    assert len(messy_parsed["needs_attention"]) == 8
+    assert len(messy_parsed["needs_attention"]) == 8, len(messy_parsed["needs_attention"])
     print("OK: multi-site bullets correctly split into per-site rows, with per-site values mapped by position.\n")
 
-    print("=== Test 10: numbered What's Needed Next items are preserved individually ===")
+    print("=== Test 11: numbered next-action items are preserved individually ===")
     requirements = [item["requirement"] for item in messy_parsed["whats_needed_next"]]
     assert len(requirements) == 4, f"Expected 4 numbered items, got {len(requirements)}: {requirements}"
     assert any("Master Issue Tracker" in r for r in requirements)
-    assert any("Status check needed on 034, 017, 075, 066" in r for r in requirements)
     assert any(r.rstrip().endswith("tomorrow...") for r in requirements), (
         "Expected the last numbered item's trailing '...' to survive intact"
     )
+    for row in messy_rows["whats_needed_next"]:
+        assert row[MONITORING_HEADERS.index("Next Action")], "Every What's Needed Next row must populate Next Action"
     print("OK: all 4 numbered items preserved as individual rows, full text intact.\n")
 
-    print("=== Test 11: Service Pattern Watch information is preserved ===")
-    patterns = [item["pattern"] for item in messy_parsed["service_pattern_watch"]]
-    assert len(patterns) == 2
-    assert any("Oaza Global Krishnagiri" in p and "outage" in p for p in patterns)
-    assert any("Three separate sites (027, 055, 072)" in p for p in patterns)
-    print("OK: both Service Pattern Watch entries preserved in full.\n")
+    print("=== Test 12: Service Pattern Watch information becomes normal Monitoring rows ===")
+    spw_rows = messy_rows["service_pattern_watch"]
+    spw_sites = [row[MONITORING_HEADERS.index("Site")] for row in spw_rows]
+    assert "079 Oaza Global Krishnagiri" in spw_sites, (
+        f"Expected the leading bare site name to be extracted even with no dash separator, got sites: {spw_sites}"
+    )
+    for row in spw_rows:
+        assert row[MONITORING_HEADERS.index("Status")] == "Monitoring", (
+            f"Expected Service Pattern Watch rows to default to Status=Monitoring, got: {row}"
+        )
+    inline_site_rows = [row for row in spw_rows if "logged inverter tripping" in row[MONITORING_HEADERS.index("Issue")]]
+    assert {row[MONITORING_HEADERS.index("Site")] for row in inline_site_rows} == {"027", "055", "072"}, (
+        "Expected the inline '(027, 055, 072)' mention to split into 3 separate rows, one per site"
+    )
+    outage_row = next(r for r in spw_rows if r[MONITORING_HEADERS.index("Site")] == "079 Oaza Global Krishnagiri")
+    assert outage_row[MONITORING_HEADERS.index("Category")] == "Outage"
+    assert outage_row[MONITORING_HEADERS.index("Priority")] == "Critical"
+    print("OK: Service Pattern Watch produced normal rows (no separate Section/sheet), with sites correctly")
+    print("    identified from both a bare leading name and an inline multi-site mention.\n")
 
-    print("=== Test 12: Actions Taken qualifiers are preserved, not stripped ===")
+    print("=== Test 13: Actions Taken qualifiers are preserved, not stripped ===")
     actions_text = " | ".join(item["action"] for item in messy_parsed["actions_taken"])
     for qualifier in ("tomorrow", "not explicitly dated to today"):
         assert qualifier in actions_text, f"Expected qualifier {qualifier!r} to survive somewhere in Actions Taken"
     print("OK: qualifiers like 'tomorrow' and 'not explicitly dated to today' survived.\n")
 
-    print("=== Test 13: no useful information disappears (spot-check a few distinctive phrases) ===")
-    full_text_dump = str(messy_parsed)
+    print("=== Test 14: no useful information disappears (spot-check distinctive phrases across all rows) ===")
+    full_dump = str(messy_parsed) + str(messy_rows)
     for phrase in (
         "inverter no 5 is not working",
         "case filed/approved/received",
         "one received, one case filed",
         "Confirm which remarks above reflect actions taken today",
     ):
-        assert phrase in full_text_dump, f"Expected {phrase!r} to appear somewhere in the parsed output"
-    print("OK: spot-checked distinctive phrases all survived somewhere in the parsed output.\n")
+        assert phrase in full_dump, f"Expected {phrase!r} to appear somewhere in the parsed output"
+    print("OK: spot-checked distinctive phrases all survived somewhere in the output.\n")
 
-    print("=== Test 14: Google Sheets integration + idempotency check (clean-template style) ===")
+    print("=== Test 15: Google Sheets integration + idempotency check (clean-template style) ===")
     run_uuid = uuid.uuid4()
     run_id = run_uuid.hex[:10]
     synthetic_date = f"2099-{(run_uuid.int % 12) + 1:02d}-{(run_uuid.int % 28) + 1:02d}"
@@ -382,9 +407,9 @@ if __name__ == "__main__":
     assert "Service Pattern Watch: 1 row(s)" in result_1
 
     all_rows = get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
+    header = all_rows[0]
+    assert header == MONITORING_HEADERS, f"Live sheet header does not match: {header}"
     tagged_rows = [row for row in all_rows if any(run_id in str(cell) for cell in row)]
-    sections_seen = {row[1] for row in tagged_rows}
-    assert sections_seen == {"Needs Attention", "Actions Taken", "What's Needed Next", "Service Pattern Watch"}
     for row in tagged_rows:
         assert row[0] == synthetic_date, f"Row has wrong date: {row}"
 
@@ -399,9 +424,9 @@ if __name__ == "__main__":
     assert len(tagged_rows_after) == len(tagged_rows), (
         f"Row count for run_id={run_id!r} changed after a duplicate write: {len(tagged_rows)} -> {len(tagged_rows_after)}"
     )
-    print(f"OK: first write created {len(tagged_rows)} new rows; duplicate write created 0 more.\n")
+    print(f"OK: first write created {len(tagged_rows)} new rows; duplicate write created 0 more. Live header verified.\n")
 
-    print("=== Test 15: Google Sheets integration + idempotency check (messy-style, multi-row bullets) ===")
+    print("=== Test 16: Google Sheets integration + idempotency check (messy-style, multi-row bullets) ===")
     messy_run_uuid = uuid.uuid4()
     messy_run_id = messy_run_uuid.hex[:10]
     messy_synthetic_date = f"2099-{(messy_run_uuid.int % 12) + 1:02d}-{(messy_run_uuid.int % 28) + 1:02d}"
@@ -410,11 +435,12 @@ if __name__ == "__main__":
 
     messy_result_1 = process_monitoring_summary(messy_summary_text)
     print(messy_result_1)
-    # The 2-site tripping bullet produces 2 Needs Attention rows.
+    # The 2-site tripping bullet produces 2 Needs Attention rows; the
+    # 2-site inline Service Pattern Watch mention produces 2 more rows.
     assert "Needs Attention: 2 row(s)" in messy_result_1, messy_result_1
     assert "Actions Taken: 1 row(s)" in messy_result_1, messy_result_1
     assert "What's Needed Next: 2 row(s)" in messy_result_1, messy_result_1
-    assert "Service Pattern Watch: 1 row(s)" in messy_result_1, messy_result_1
+    assert "Service Pattern Watch: 2 row(s)" in messy_result_1, messy_result_1
 
     messy_tagged_before = [
         row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)

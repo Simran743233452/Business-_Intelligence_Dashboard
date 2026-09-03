@@ -26,23 +26,25 @@ service = build(
 
 # Test row - matches the unified Monitoring sheet schema (see
 # summary_parser.MONITORING_HEADERS):
-# Date | Section | Site | Description | Days Open | Action Taken |
-# What's Needed Next | New Issues | Issues Resolved | Total Open Issues |
-# Vendor | Pattern/Notes
-# A clearly synthetic date (year 2099) keeps this from ever being mistaken
-# for a real report.
+# Date | Site | Issue | Category | Priority | Status | Days Open |
+# Action Taken | Next Action | Vendor | New Issues | Issues Resolved |
+# Total Open Issues | Notes
+# A clearly synthetic date (year 2099) and Site keep this from ever being
+# mistaken for a real report.
 test_row = [
     "2099-01-01",
-    "Daily Summary",
-    "",
+    "TEST SITE",
     "Testing Google Sheets connection",
     "",
     "",
     "",
-    0,
-    0,
-    0,
     "",
+    "",
+    "",
+    "",
+    0,
+    0,
+    0,
     "Added by test_sheets.py"
 ]
 
@@ -53,7 +55,7 @@ test_row = [
 # (see sheets_service.py's module docstring for the full explanation).
 result = service.spreadsheets().values().append(
     spreadsheetId=SPREADSHEET_ID,
-    range=f"{SHEET_NAME}!A:L",
+    range=f"{SHEET_NAME}!A:N",
     valueInputOption="RAW",
     insertDataOption="INSERT_ROWS",
     body={
