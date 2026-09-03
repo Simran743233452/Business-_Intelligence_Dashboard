@@ -5,6 +5,17 @@ one place so MCP tools stay thin and this logic can be reused/tested on its
 own. Callers pass in an already-authenticated `service` object plus the
 spreadsheet id - this module does not manage credentials itself, so it
 doesn't touch the existing auth setup in mcp_server.py.
+
+All writes use valueInputOption="RAW", not "USER_ENTERED". USER_ENTERED
+makes Sheets auto-parse date-looking strings (e.g. "2026-09-02") into real
+date-typed cells - which then only *display* as that string if the cell
+also happens to have date number-formatting applied (inherited from
+existing rows/columns). A freshly-appended row without that inherited
+formatting reads back as a raw date serial number (e.g. "72964") instead
+of the string that was written, which silently breaks the exact-string
+comparisons append_unique_rows/upsert_row_by_key rely on for dedup. RAW
+stores every value as the literal text given, so what's written is always
+exactly what's read back.
 """
 
 
@@ -40,7 +51,7 @@ def ensure_tab(service, spreadsheet_id: str, tab_name: str, headers: list) -> No
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=_quoted_range(tab_name, "A1"),
-        valueInputOption="USER_ENTERED",
+        valueInputOption="RAW",
         body={"values": [headers]},
     ).execute()
 
@@ -85,7 +96,7 @@ def append_unique_rows(
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=_quoted_range(tab_name, "A:Z"),
-        valueInputOption="USER_ENTERED",
+        valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": new_rows},
     ).execute()
@@ -94,27 +105,32 @@ def append_unique_rows(
 
 
 def upsert_row_by_key(
-    service, spreadsheet_id: str, tab_name: str, headers: list, row: list, key_index: int
+    service, spreadsheet_id: str, tab_name: str, headers: list, row: list, key_indexes: list
 ) -> str:
-    """Insert `row`, or overwrite the existing row sharing the same key column.
+    """Insert `row`, or overwrite the existing row sharing the same values
+    in `key_indexes`.
 
-    Used for tabs where a column (e.g. Date) should only appear once -
-    re-processing the same day's summary updates that row in place instead
-    of appending a duplicate. Returns "inserted" or "updated".
+    `key_indexes` can be a single column (e.g. just Date) or a composite
+    key (e.g. Date + Section) - composite matters once a tab holds more
+    than one kind of row, so upserting one kind can never accidentally
+    match a differently-shaped row that merely happens to share one
+    column's value. Returns "inserted" or "updated".
     """
     ensure_tab(service, spreadsheet_id, tab_name, headers)
 
     values = get_tab_values(service, spreadsheet_id, tab_name)
-    key_value = str(row[key_index])
+    key_value = tuple(str(row[i]) for i in key_indexes)
 
     for row_index, existing_row in enumerate(values[1:], start=2):
-        existing_key = existing_row[key_index] if key_index < len(existing_row) else ""
+        existing_key = tuple(
+            existing_row[i] if i < len(existing_row) else "" for i in key_indexes
+        )
         if existing_key == key_value:
             end_col = chr(ord("A") + len(headers) - 1)
             service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=_quoted_range(tab_name, f"A{row_index}:{end_col}{row_index}"),
-                valueInputOption="USER_ENTERED",
+                valueInputOption="RAW",
                 body={"values": [row]},
             ).execute()
             return "updated"
@@ -122,7 +138,7 @@ def upsert_row_by_key(
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=_quoted_range(tab_name, "A:Z"),
-        valueInputOption="USER_ENTERED",
+        valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": [row]},
     ).execute()

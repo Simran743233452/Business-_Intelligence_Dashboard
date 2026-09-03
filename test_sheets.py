@@ -24,24 +24,32 @@ service = build(
     credentials=credentials
 )
 
-# Test row
+# Test row - matches the unified Monitoring sheet schema (see
+# summary_parser.MONITORING_HEADERS):
+# Date | Section | Site | Description | Days Open | Action Taken |
+# What's Needed Next | New Issues | Issues Resolved | Total Open Issues |
+# Vendor | Notes
+# A clearly synthetic date (year 2099) keeps this from ever being mistaken
+# for a real report.
 test_row = [
-    "2026-09-01",
-    "TEST",
-    "Test Site",
+    "2099-01-01",
+    "Daily Summary",
+    "",
     "Testing Google Sheets connection",
-    1,
+    "",
+    "",
+    "",
     0,
-    "Connection test",
-    "No action required",
-    "TEST",
-    "Added by Python"
+    0,
+    0,
+    "",
+    "Added by test_sheets.py"
 ]
 
 # Add row to Monitoring sheet
 result = service.spreadsheets().values().append(
     spreadsheetId=SPREADSHEET_ID,
-    range=f"{SHEET_NAME}!A:J",
+    range=f"{SHEET_NAME}!A:L",
     valueInputOption="USER_ENTERED",
     insertDataOption="INSERT_ROWS",
     body={

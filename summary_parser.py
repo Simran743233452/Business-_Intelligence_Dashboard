@@ -21,7 +21,7 @@ Expected template:
     - [Site] — [Issue] — [Action]
 
     WHAT'S NEEDED NEXT
-    - [Requirement]
+    - [Site] — [required next action]
 
     SERVICE PATTERN WATCH
     - [Recurring issue/site/vendor pattern]
@@ -191,9 +191,31 @@ def _parse_actions_taken(block: str) -> list:
     return items
 
 
+def _split_dash_once(text: str) -> list:
+    """Split on the FIRST field separator only (em dash, en dash, or a
+    spaced hyphen) - used for a bullet with exactly two logical fields
+    (site, then free text) where the free text itself might legitimately
+    contain further dashes that shouldn't be treated as more fields.
+    """
+    for sep in ("—", "–"):
+        if sep in text:
+            site, _, rest = text.partition(sep)
+            return [site.strip(), rest.strip()]
+    match = re.search(r"\s-\s", text)
+    if match:
+        return [text[: match.start()].strip(), text[match.end():].strip()]
+    return [text.strip()]
+
+
 def _parse_whats_needed_next(block: str) -> list:
+    """Parse "- [Site] — [required next action]" bullets.
+
+    If a bullet has no site separator at all (just free text), site is
+    left blank rather than guessed - this also keeps older-style
+    single-field requirement bullets working.
+    """
     lines = _block_lines(block)
-    items = []
+    raw_items = []
     for line in lines:
         content = _strip_bullet(line)
         if not content:
@@ -204,9 +226,18 @@ def _parse_whats_needed_next(block: str) -> list:
         # single line to begin with, so a normal, already-separated
         # requirement is never mis-split.
         if len(lines) == 1 and BULLET_RESPLIT_RE.search(content):
-            items.extend(part.strip() for part in BULLET_RESPLIT_RE.split(content) if part.strip())
+            raw_items.extend(part.strip() for part in BULLET_RESPLIT_RE.split(content) if part.strip())
         else:
-            items.append(content)
+            raw_items.append(content)
+
+    items = []
+    for content in raw_items:
+        parts = _split_dash_once(content)
+        if len(parts) == 2:
+            site, requirement = parts
+        else:
+            site, requirement = "", parts[0]
+        items.append({"site": site, "requirement": requirement})
     return items
 
 
@@ -244,7 +275,7 @@ def parse_monitoring_summary(summary: str) -> dict:
             "total_open_issues": int,
             "needs_attention": [{"site", "issue", "days_open", "reason"}, ...],
             "actions_taken": [{"site", "issue", "action"}, ...],
-            "whats_needed_next": [str, ...],
+            "whats_needed_next": [{"site", "requirement"}, ...],
             "service_pattern_watch": [{"pattern", "site", "vendor", "notes"}, ...],
         }
 
@@ -299,4 +330,109 @@ def parse_monitoring_summary(summary: str) -> dict:
         "actions_taken": _parse_actions_taken(blocks.get("actions_taken", "")),
         "whats_needed_next": _parse_whats_needed_next(blocks.get("whats_needed_next", "")),
         "service_pattern_watch": _parse_service_pattern_watch(blocks.get("service_pattern_watch", "")),
+    }
+
+
+# -----------------------------------------------------------------------
+# Unified Monitoring sheet schema
+# -----------------------------------------------------------------------
+# All five sections now write into ONE "Monitoring" tab (rather than one
+# tab per section), distinguished by the Section column. This is a
+# separate transformation step on top of parse_monitoring_summary()'s
+# output above - the section-detection/tolerance logic itself is
+# untouched, this just reshapes the already-parsed data into flat rows.
+MONITORING_HEADERS = [
+    "Date",
+    "Section",
+    "Site",
+    "Description",
+    "Days Open",
+    "Action Taken",
+    "What's Needed Next",
+    "New Issues",
+    "Issues Resolved",
+    "Total Open Issues",
+    "Vendor",
+    "Notes",
+]
+
+# Column name -> position, so row-building reads as named slots instead
+# of magic indexes.
+_COL = {name: index for index, name in enumerate(MONITORING_HEADERS)}
+
+
+def _empty_row(date_value: str, section: str) -> list:
+    row = [""] * len(MONITORING_HEADERS)
+    row[_COL["Date"]] = date_value
+    row[_COL["Section"]] = section
+    return row
+
+
+def build_monitoring_rows(parsed: dict) -> dict:
+    """Convert parse_monitoring_summary()'s structured dict into row lists
+    for the unified Monitoring sheet (column order: MONITORING_HEADERS).
+
+    Returns one list per section:
+        {
+            "daily_summary": [row],                 # always exactly 1
+            "needs_attention": [row, ...],
+            "actions_taken": [row, ...],
+            "whats_needed_next": [row, ...],
+            "service_pattern_watch": [row, ...],
+        }
+    kept separate (rather than one flat list) so a caller can write/dedupe
+    each section independently while they all share one tab and one
+    column layout.
+
+    Fields a section's bullet format doesn't supply (e.g. Vendor for a
+    Needs Attention row - the template only gives one combined "reason"
+    field there, not a distinct vendor) are left blank rather than
+    guessed, per the "don't invent values" rule.
+    """
+    date_value = parsed["date"]
+
+    daily_row = _empty_row(date_value, "Daily Summary")
+    daily_row[_COL["New Issues"]] = parsed["new_issues"]
+    daily_row[_COL["Issues Resolved"]] = parsed["resolved_issues"]
+    daily_row[_COL["Total Open Issues"]] = parsed["total_open_issues"]
+
+    needs_attention_rows = []
+    for item in parsed["needs_attention"]:
+        row = _empty_row(date_value, "Needs Attention")
+        row[_COL["Site"]] = item["site"]
+        row[_COL["Description"]] = item["issue"]
+        row[_COL["Days Open"]] = item["days_open"]
+        row[_COL["Notes"]] = item["reason"]
+        needs_attention_rows.append(row)
+
+    actions_taken_rows = []
+    for item in parsed["actions_taken"]:
+        row = _empty_row(date_value, "Actions Taken")
+        row[_COL["Site"]] = item["site"]
+        row[_COL["Description"]] = item["issue"]
+        row[_COL["Action Taken"]] = item["action"]
+        actions_taken_rows.append(row)
+
+    whats_needed_next_rows = []
+    for item in parsed["whats_needed_next"]:
+        row = _empty_row(date_value, "What's Needed Next")
+        row[_COL["Site"]] = item["site"]
+        row[_COL["What's Needed Next"]] = item["requirement"]
+        whats_needed_next_rows.append(row)
+
+    service_pattern_watch_rows = []
+    for item in parsed["service_pattern_watch"]:
+        row = _empty_row(date_value, "Service Pattern Watch")
+        row[_COL["Site"]] = item["site"]
+        row[_COL["Description"]] = item["pattern"]
+        row[_COL["Vendor"]] = item["vendor"]
+        row[_COL["Notes"]] = item["notes"]
+        service_pattern_watch_rows.append(row)
+
+    return {
+        "daily_summary": [daily_row],
+        "needs_attention": needs_attention_rows,
+        "actions_taken": actions_taken_rows,
+        "whats_needed_next": whats_needed_next_rows,
+        "service_pattern_watch": service_pattern_watch_rows,
     }
