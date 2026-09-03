@@ -28,7 +28,7 @@ service = build(
 # summary_parser.MONITORING_HEADERS):
 # Date | Section | Site | Description | Days Open | Action Taken |
 # What's Needed Next | New Issues | Issues Resolved | Total Open Issues |
-# Vendor | Notes
+# Vendor | Pattern/Notes
 # A clearly synthetic date (year 2099) keeps this from ever being mistaken
 # for a real report.
 test_row = [
@@ -46,11 +46,15 @@ test_row = [
     "Added by test_sheets.py"
 ]
 
-# Add row to Monitoring sheet
+# Add row to Monitoring sheet. valueInputOption="RAW" (not USER_ENTERED)
+# so the date string is stored as literal text - USER_ENTERED lets Sheets
+# auto-parse date-looking strings into date-typed cells, which can then
+# read back as a raw date-serial number instead of this exact string
+# (see sheets_service.py's module docstring for the full explanation).
 result = service.spreadsheets().values().append(
     spreadsheetId=SPREADSHEET_ID,
     range=f"{SHEET_NAME}!A:L",
-    valueInputOption="USER_ENTERED",
+    valueInputOption="RAW",
     insertDataOption="INSERT_ROWS",
     body={
         "values": [test_row]
